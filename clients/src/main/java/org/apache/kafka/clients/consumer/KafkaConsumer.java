@@ -795,8 +795,8 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                     this.time,
                     this.retryBackoffMs,
                     this.requestTimeoutMs,
-                    isolationLevel);
-
+                    isolationLevel,
+                    config.getBoolean(ConsumerConfig.NEAREST_OFFSET_RESET));
             config.logUnused();
             AppInfoParser.registerAppInfo(JMX_PREFIX, clientId, metrics);
             log.debug("Kafka consumer initialized");

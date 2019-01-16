@@ -881,6 +881,24 @@ public class FetcherTest {
     }
 
     @Test
+    public void testFetchOffsetOutOfRangeWithNearestReset() {
+        Fetcher<byte[], byte[]> fetcher = createFetcher(subscriptions, new Metrics(time), true);
+        subscriptions.assignFromUser(singleton(tp1));
+        subscriptions.seek(tp1, 9);
+
+        assertEquals(1, fetcher.sendFetches());
+        client.prepareResponse(fullFetchResponse(tp1, this.records, Errors.OFFSET_OUT_OF_RANGE, 100L, 0));
+        consumerClient.poll(time.timer(0));
+        assertEquals(0, fetcher.fetchedRecords().size());
+        assertTrue(subscriptions.isOffsetResetNeeded(tp1));
+        assertEquals(OffsetResetStrategy.NEAREST, subscriptions.resetStrategy(tp1));
+        assertEquals(null, subscriptions.position(tp1));
+        assertEquals(new Long(9), subscriptions.outOffRangeOffset(tp1));
+        fetcher.close();
+    }
+
+
+    @Test
     public void testStaleOutOfRangeError() {
         // verify that an out of range error which arrives after a seek
         // does not cause us to reset our position or throw an exception
@@ -1124,6 +1142,48 @@ public class FetcherTest {
         assertFalse(subscriptions.isOffsetResetNeeded(tp0));
         assertTrue(subscriptions.isFetchable(tp0));
         assertEquals(5, subscriptions.position(tp0).longValue());
+    }
+
+    @Test
+    public void testNearestOffsetResetWithSmallerOffset() {
+        Fetcher<byte[], byte[]> fetcher = createFetcher(subscriptions, new Metrics(time), true);
+        subscriptions.assignFromUser(singleton(tp0));
+        subscriptions.requestOffsetReset(tp0, OffsetResetStrategy.NEAREST, 1L);
+
+        client.prepareResponse(listOffsetRequestMatcher(ListOffsetRequest.EARLIEST_TIMESTAMP),
+            listOffsetResponse(Errors.NONE, 1L, 5L));
+        client.prepareResponse(listOffsetRequestMatcher(ListOffsetRequest.LATEST_TIMESTAMP),
+            listOffsetResponse(Errors.NONE, 1L, 100L));
+        fetcher.resetOffsetsIfNeeded();
+        consumerClient.pollNoWakeup();
+        assertFalse(subscriptions.isOffsetResetNeeded(tp0));
+        assertTrue(subscriptions.isFetchable(tp0));
+        assertEquals(5, subscriptions.position(tp0).longValue());
+        fetcher.close();
+    }
+
+    @Test
+    public void testNearestOffsetResetWithLargerOffset() {
+        Fetcher<byte[], byte[]> fetcher = createFetcher(subscriptions, new Metrics(time), true);
+        subscriptions.assignFromUser(singleton(tp0));
+        subscriptions.requestOffsetReset(tp0, OffsetResetStrategy.NEAREST, 150L);
+
+        client.prepareResponse(listOffsetRequestMatcher(ListOffsetRequest.EARLIEST_TIMESTAMP),
+            listOffsetResponse(Errors.NONE, 1L, 5L));
+        client.prepareResponse(listOffsetRequestMatcher(ListOffsetRequest.LATEST_TIMESTAMP),
+            listOffsetResponse(Errors.NONE, 1L, 100L));
+        fetcher.resetOffsetsIfNeeded();
+        consumerClient.pollNoWakeup();
+        // First reset should not be success since outOfRangeOffset is larger than earliest offset
+        assertTrue(subscriptions.isOffsetResetNeeded(tp0));
+        assertFalse(subscriptions.isFetchable(tp0));
+
+        fetcher.resetOffsetsIfNeeded();
+        consumerClient.pollNoWakeup();
+        assertFalse(subscriptions.isOffsetResetNeeded(tp0));
+        assertTrue(subscriptions.isFetchable(tp0));
+        assertEquals(100, subscriptions.position(tp0).longValue());
+        fetcher.close();
     }
 
     /**
@@ -2940,6 +3000,22 @@ public class FetcherTest {
                                                Deserializer<V> valueDeserializer,
                                                int maxPollRecords,
                                                IsolationLevel isolationLevel) {
+        return createFetcher(subscriptions, metrics, keyDeserializer, valueDeserializer, maxPollRecords,
+            isolationLevel, false);
+    }
+
+    private Fetcher<byte[], byte[]> createFetcher(SubscriptionState subscriptions, Metrics metrics, boolean useNearestReset) {
+        return createFetcher(subscriptions, metrics, new ByteArrayDeserializer(), new ByteArrayDeserializer(),
+            Integer.MAX_VALUE, IsolationLevel.READ_UNCOMMITTED, useNearestReset);
+    }
+
+    private <K, V> Fetcher<K, V> createFetcher(SubscriptionState subscriptions,
+                                               Metrics metrics,
+                                               Deserializer<K> keyDeserializer,
+                                               Deserializer<V> valueDeserializer,
+                                               int maxPollRecords,
+                                               IsolationLevel isolationLevel,
+                                               boolean useNearestOffset) {
         return new Fetcher<>(
                 new LogContext(),
                 consumerClient,
@@ -2958,7 +3034,8 @@ public class FetcherTest {
                 time,
                 retryBackoffMs,
                 requestTimeoutMs,
-                isolationLevel);
+                isolationLevel,
+                useNearestOffset);
     }
 
     private <T> List<Long> collectRecordOffsets(List<ConsumerRecord<T, T>> records) {

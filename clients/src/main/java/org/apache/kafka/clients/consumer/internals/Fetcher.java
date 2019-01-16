@@ -108,6 +108,7 @@ import static java.util.Collections.emptyList;
  * </ul>
  */
 public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
+    private static final long NEAREST_TIMESTAMP = -3L;
     private final Logger log;
     private final LogContext logContext;
     private final ConsumerNetworkClient client;
@@ -133,6 +134,8 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
 
     private PartitionRecords nextInLineRecords = null;
 
+    private final boolean useNearestOffsetReset;
+
     public Fetcher(LogContext logContext,
                    ConsumerNetworkClient client,
                    int minBytes,
@@ -151,6 +154,50 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
                    long retryBackoffMs,
                    long requestTimeoutMs,
                    IsolationLevel isolationLevel) {
+        this(logContext,
+            client,
+            minBytes,
+            maxBytes,
+            maxWaitMs,
+            fetchSize,
+            maxPollRecords,
+            checkCrcs,
+            keyDeserializer,
+            valueDeserializer,
+            metadata,
+            subscriptions,
+            metrics,
+            metricsRegistry,
+            time,
+            retryBackoffMs,
+            requestTimeoutMs,
+            isolationLevel,
+            /* Disable nearest offset for code path that use this constructor. The nearest offset reset is meant to be used only in client consumer.
+                We don't want to risk using nearest reset with other internal module of kafka eg. follower broker replication.
+                This also make the nearest reset feature not effect the old test case.
+             */
+            false);
+    }
+
+    public Fetcher(LogContext logContext,
+                   ConsumerNetworkClient client,
+                   int minBytes,
+                   int maxBytes,
+                   int maxWaitMs,
+                   int fetchSize,
+                   int maxPollRecords,
+                   boolean checkCrcs,
+                   Deserializer<K> keyDeserializer,
+                   Deserializer<V> valueDeserializer,
+                   Metadata metadata,
+                   SubscriptionState subscriptions,
+                   Metrics metrics,
+                   FetcherMetricsRegistry metricsRegistry,
+                   Time time,
+                   long retryBackoffMs,
+                   long requestTimeoutMs,
+                   IsolationLevel isolationLevel,
+                   boolean useNearestOffsetReset) {
         this.log = logContext.logger(Fetcher.class);
         this.logContext = logContext;
         this.time = time;
@@ -170,6 +217,7 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
         this.retryBackoffMs = retryBackoffMs;
         this.requestTimeoutMs = requestTimeoutMs;
         this.isolationLevel = isolationLevel;
+        this.useNearestOffsetReset = useNearestOffsetReset;
         this.sessionHandlers = new HashMap<>();
 
         subscriptions.addListener(this);
@@ -360,6 +408,8 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
             return ListOffsetRequest.EARLIEST_TIMESTAMP;
         else if (strategy == OffsetResetStrategy.LATEST)
             return ListOffsetRequest.LATEST_TIMESTAMP;
+        else if (strategy == OffsetResetStrategy.NEAREST)
+            return NEAREST_TIMESTAMP;
         else
             return null;
     }
@@ -578,12 +628,28 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
             log.debug("Skipping reset of partition {} since it is no longer assigned", partition);
         } else if (!subscriptions.isOffsetResetNeeded(partition)) {
             log.debug("Skipping reset of partition {} since reset is no longer needed", partition);
-        } else if (!requestedResetTimestamp.equals(offsetResetStrategyTimestamp(partition))) {
+        } else if (!requestedResetTimestamp.equals(offsetResetStrategyTimestamp(partition)) && !subscriptions.isNearestStrategy(partition)) {
+            // NOTE: for nearest reset strategy, the requestedResetTimestamp will not be equal to the strategy timestamp,
+            // so we'll always do the reset
             log.debug("Skipping reset of partition {} since an alternative reset has been requested", partition);
         } else {
             log.info("Resetting offset for partition {} to offset {}.", partition, offsetData.offset);
             subscriptions.seek(partition, offsetData.offset);
         }
+    }
+
+    private Map<TopicPartition, ListOffsetRequest.PartitionData> formatToValidResetTimestamp(Map<TopicPartition, ListOffsetRequest.PartitionData> original) {
+        Map<TopicPartition, ListOffsetRequest.PartitionData> newFormat = new HashMap<>();
+        original.forEach((tp, pd) -> {
+            // since NEAREST_TIMESTAMP is not implemented on the broker,
+            // we'll try get earliest timestamp first
+            if (pd.timestamp == NEAREST_TIMESTAMP) {
+                newFormat.put(tp, new ListOffsetRequest.PartitionData(ListOffsetRequest.EARLIEST_TIMESTAMP, pd.currentLeaderEpoch));
+            } else {
+                newFormat.put(tp, pd);
+            }
+        });
+        return newFormat;
     }
 
     private void resetOffsetsAsync(Map<TopicPartition, Long> partitionResetTimestamps) {
@@ -598,7 +664,8 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
             final Map<TopicPartition, ListOffsetRequest.PartitionData> resetTimestamps = entry.getValue();
             subscriptions.setResetPending(resetTimestamps.keySet(), time.milliseconds() + requestTimeoutMs);
 
-            RequestFuture<ListOffsetResult> future = sendListOffsetRequest(node, resetTimestamps, false);
+            Map<TopicPartition, ListOffsetRequest.PartitionData> validResetTimestamps = formatToValidResetTimestamp(resetTimestamps);
+            RequestFuture<ListOffsetResult> future = sendListOffsetRequest(node, validResetTimestamps, false);
             future.addListener(new RequestFutureListener<ListOffsetResult>() {
                 @Override
                 public void onSuccess(ListOffsetResult result) {
@@ -606,12 +673,26 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
                         subscriptions.resetFailed(result.partitionsToRetry, time.milliseconds() + retryBackoffMs);
                         metadata.requestUpdate();
                     }
-
+                    Map<TopicPartition, Long> needNewReset = new HashMap<>();
                     for (Map.Entry<TopicPartition, OffsetData> fetchedOffset : result.fetchedOffsets.entrySet()) {
                         TopicPartition partition = fetchedOffset.getKey();
                         OffsetData offsetData = fetchedOffset.getValue();
+
+                        ListOffsetRequest.PartitionData timestamp = resetTimestamps.get(partition);
+                        if (timestamp != null && timestamp.timestamp == NEAREST_TIMESTAMP) {
+                            // outOffRangeOffset is higher than earliest offset in kafka,
+                            // meaning that the outOffRangeOffset is also higher than logsize
+                            // so we will send a request again to reset to latest
+                            if (subscriptions.outOffRangeOffset(partition) > offsetData.offset) {
+                                needNewReset.put(partition, ListOffsetRequest.LATEST_TIMESTAMP);
+                                continue;
+                            }
+                        }
                         ListOffsetRequest.PartitionData requestedReset = resetTimestamps.get(partition);
                         resetOffsetIfNeeded(partition, requestedReset.timestamp, offsetData);
+                    }
+                    if (needNewReset.size() > 0) {
+                        resetOffsetsAsync(needNewReset);
                     }
                 }
 
@@ -984,8 +1065,13 @@ public class Fetcher<K, V> implements SubscriptionState.Listener, Closeable {
                     log.debug("Discarding stale fetch response for partition {} since the fetched offset {} " +
                             "does not match the current offset {}", tp, fetchOffset, subscriptions.position(tp));
                 } else if (subscriptions.hasDefaultOffsetResetPolicy()) {
-                    log.info("Fetch offset {} is out of range for partition {}, resetting offset", fetchOffset, tp);
-                    subscriptions.requestOffsetReset(tp);
+                    if (useNearestOffsetReset) {
+                        log.info("Fetch offset {} is out of range for partition {}, resetting offset with nearest offset", fetchOffset, tp);
+                        subscriptions.requestOffsetReset(tp, OffsetResetStrategy.NEAREST, fetchOffset);
+                    } else {
+                        log.info("Fetch offset {} is out of range for partition {}, resetting offset", fetchOffset, tp);
+                        subscriptions.requestOffsetReset(tp);
+                    }
                 } else {
                     throw new OffsetOutOfRangeException(Collections.singletonMap(tp, fetchOffset));
                 }

@@ -326,6 +326,10 @@ public class SubscriptionState {
         return allConsumed;
     }
 
+    public void requestOffsetReset(TopicPartition partition, OffsetResetStrategy offsetResetStrategy, Long outOfRangeOffset) {
+        assignedState(partition).reset(offsetResetStrategy, outOfRangeOffset);
+    }
+
     public void requestOffsetReset(TopicPartition partition, OffsetResetStrategy offsetResetStrategy) {
         assignedState(partition).reset(offsetResetStrategy);
     }
@@ -351,6 +355,13 @@ public class SubscriptionState {
     public OffsetResetStrategy resetStrategy(TopicPartition partition) {
         return assignedState(partition).resetStrategy;
     }
+    public boolean isNearestStrategy(TopicPartition partition) {
+        return assignedState(partition).resetStrategy == OffsetResetStrategy.NEAREST;
+    }
+    public Long outOffRangeOffset(TopicPartition partition) {
+        return assignedState(partition).outOfRangeOffset;
+    }
+
 
     public boolean hasAllFetchPositions() {
         return assignment.stream().allMatch(state -> state.value().hasValidPosition());
@@ -450,6 +461,7 @@ public class SubscriptionState {
         private boolean paused;  // whether this partition has been paused by the user
         private OffsetResetStrategy resetStrategy;  // the strategy to use if the offset needs resetting
         private Long nextAllowedRetryTimeMs;
+        private Long outOfRangeOffset; // save the out of range offset for nearest reset
 
         TopicPartitionState() {
             this.paused = false;
@@ -459,11 +471,17 @@ public class SubscriptionState {
             this.lastStableOffset = null;
             this.resetStrategy = null;
             this.nextAllowedRetryTimeMs = null;
+            this.outOfRangeOffset = null;
         }
 
         private void reset(OffsetResetStrategy strategy) {
+            reset(strategy, null);
+        }
+
+        private void reset(OffsetResetStrategy strategy, Long outOfRangeOffset) {
             this.resetStrategy = strategy;
             this.position = null;
+            this.outOfRangeOffset = outOfRangeOffset;
             this.nextAllowedRetryTimeMs = null;
         }
 
@@ -498,6 +516,7 @@ public class SubscriptionState {
         private void seek(long offset) {
             this.position = offset;
             this.resetStrategy = null;
+            this.outOfRangeOffset = null;
             this.nextAllowedRetryTimeMs = null;
         }
 
@@ -517,6 +536,10 @@ public class SubscriptionState {
 
         private boolean isFetchable() {
             return !paused && hasValidPosition();
+        }
+
+        private Long getOutOfRangeOffset() {
+            return outOfRangeOffset;
         }
 
     }
